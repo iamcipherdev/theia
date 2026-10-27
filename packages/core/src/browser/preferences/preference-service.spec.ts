@@ -50,6 +50,9 @@ function createTestContainer(): Container {
 }
 
 describe('Preference Service', () => {
+    // JSON null is a valid preference value, distinct from an unset preference.
+    // eslint-disable-next-line no-null/no-null
+    const nullValue = null;
     let prefService: PreferenceServiceImpl;
     let prefSchema: PreferenceSchemaService;
 
@@ -295,6 +298,17 @@ describe('Preference Service', () => {
             checkValues(preferences, 8, undefined, undefined, 8);
         });
 
+        it('replaces a null workspace value even when the user value matches the requested value', async () => {
+            const { preferences } = prepareServices();
+            await getProvider(PreferenceScope.User).setPreference(TAB_SIZE, 2);
+            await getProvider(PreferenceScope.Workspace).setPreference(TAB_SIZE, nullValue);
+
+            await preferences.updateValue(TAB_SIZE, 2, DUMMY_URI);
+
+            assert.strictEqual(preferences.get(TAB_SIZE), 2);
+            assert.strictEqual(getProvider(PreferenceScope.Workspace).get(TAB_SIZE), 2);
+        });
+
         it('clears all settings when input is undefined.', async () => {
             const { preferences } = prepareServices();
 
@@ -450,18 +464,18 @@ describe('Preference Service', () => {
             const { preferences } = prepareServices();
 
             getProvider(PreferenceScope.User).setPreference('editor.tabSize', 2);
-            getProvider(PreferenceScope.Workspace).setPreference('editor.tabSize', null);
+            getProvider(PreferenceScope.Workspace).setPreference('editor.tabSize', nullValue);
 
             // get() already treats null as set; inspect().value must agree with it.
-            assert.strictEqual(preferences.get('editor.tabSize'), null);
+            assert.strictEqual(preferences.get('editor.tabSize'), nullValue);
             assert.deepStrictEqual(preferences.inspect('editor.tabSize'), {
                 preferenceName: 'editor.tabSize',
                 defaultValue: 4,
                 globalValue: 2,
-                workspaceValue: null,
+                workspaceValue: nullValue,
                 workspaceFolderValue: undefined,
                 sessionValue: undefined,
-                value: null,
+                value: nullValue,
             });
         });
 
@@ -560,6 +574,66 @@ describe('Preference Service', () => {
             assert.strictEqual(false, preferences.get('[go].editor.insertSpaces'));
             assert.strictEqual(false, preferences.get('editor.formatOnSave'));
             assert.strictEqual(true, preferences.get('[go].editor.formatOnSave'));
+        });
+    });
+
+    describe('inspect() value precedence', () => {
+        const preferenceName = 'test.precedence';
+        const resourceUri = 'dummy_uri';
+        const scopes = [PreferenceScope.User, PreferenceScope.Workspace, PreferenceScope.Folder, PreferenceScope.Session];
+
+        beforeEach(() => {
+            prefSchema.addSchema({
+                scope: PreferenceScope.Folder,
+                properties: {
+                    [preferenceName]: { type: ['string', 'number', 'boolean', 'object', 'null'], default: 'default' }
+                }
+            });
+        });
+
+        for (const scope of scopes) {
+            for (const value of [nullValue, false, 0, '']) {
+                it(`preserves ${JSON.stringify(value)} in ${PreferenceScope[scope]} scope`, async () => {
+                    for (const lowerScope of scopes.slice(0, scopes.indexOf(scope))) {
+                        await prefService.set(preferenceName, PreferenceScope[lowerScope], lowerScope, resourceUri);
+                    }
+                    await prefService.set(preferenceName, value, scope, resourceUri);
+
+                    assert.strictEqual(prefService.inspect(preferenceName, resourceUri)?.value, value);
+                    assert.strictEqual(prefService.get(preferenceName, undefined, resourceUri), value);
+                });
+            }
+        }
+
+        it('falls through undefined values in Session, Folder, Workspace, User, Default order', async () => {
+            for (const scope of scopes) {
+                await prefService.set(preferenceName, PreferenceScope[scope], scope, resourceUri);
+            }
+            for (const scope of [...scopes].reverse()) {
+                assert.strictEqual(prefService.inspect(preferenceName, resourceUri)?.value, PreferenceScope[scope]);
+                assert.strictEqual(prefService.get(preferenceName, undefined, resourceUri), PreferenceScope[scope]);
+                await prefService.set(preferenceName, undefined, scope, resourceUri);
+            }
+            assert.strictEqual(prefService.inspect(preferenceName, resourceUri)?.value, 'default');
+            assert.strictEqual(prefService.get(preferenceName, undefined, resourceUri), 'default');
+        });
+
+        it('prefers a folder value over null in workspace scope', async () => {
+            await prefService.set(preferenceName, nullValue, PreferenceScope.Workspace);
+            await prefService.set(preferenceName, 'folder', PreferenceScope.Folder, resourceUri);
+
+            assert.strictEqual(prefService.inspect(preferenceName, resourceUri)?.value, 'folder');
+            assert.strictEqual(prefService.get(preferenceName, undefined, resourceUri), 'folder');
+        });
+
+        it('returns the selected scope value without merging objects', async () => {
+            await prefService.set(preferenceName, { user: true }, PreferenceScope.User);
+            await prefService.set(preferenceName, { workspace: true }, PreferenceScope.Workspace);
+
+            // Unlike get(), inspect() does not merge objects across scopes; preserve that existing behavior.
+            assert.deepStrictEqual(prefService.inspect(preferenceName)?.value, { workspace: true });
+            await prefService.set(preferenceName, nullValue, PreferenceScope.Workspace);
+            assert.strictEqual(prefService.inspect(preferenceName)?.value, nullValue);
         });
     });
 
